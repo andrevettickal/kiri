@@ -17,6 +17,7 @@ const NLM_F_CREATE: u16 = 0x400;
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
 const NLM_F_REPLACE: u16 = 0x100;
@@ -263,6 +264,37 @@ pub fn add_address(nl: &mut Netlink, index: i32, addr: [u8; 4], prefix: u8) -> i
     m.raw(&ifa).attr(IFA_LOCAL, &addr).attr(IFA_ADDRESS, &addr);
     match nl.request(&mut [m]) {
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
+        r => r,
+    }
+}
+
+/// Removes an IPv4 address from `index`. One that isn't there is fine.
+pub fn del_address(nl: &mut Netlink, index: i32, addr: [u8; 4], prefix: u8) -> io::Result<()> {
+    let mut m = Msg::new(RTM_DELADDR, NLM_F_ACK);
+    let mut ifa = [0u8; 8];
+    ifa[0] = libc::AF_INET as u8;
+    ifa[1] = prefix;
+    ifa[4..8].copy_from_slice(&(index as u32).to_ne_bytes());
+    m.raw(&ifa).attr(IFA_LOCAL, &addr).attr(IFA_ADDRESS, &addr);
+    match nl.request(&mut [m]) {
+        Err(e) if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) => Ok(()),
+        r => r,
+    }
+}
+
+/// Removes the IPv4 default route through `gateway` on `index`. One that
+/// isn't there is fine.
+pub fn del_default_route(nl: &mut Netlink, index: i32, gateway: [u8; 4]) -> io::Result<()> {
+    let mut m = Msg::new(RTM_DELROUTE, NLM_F_ACK);
+    let mut rt = [0u8; 12];
+    rt[0] = libc::AF_INET as u8;
+    rt[4] = libc::RT_TABLE_MAIN;
+    rt[5] = libc::RTPROT_BOOT;
+    rt[6] = libc::RT_SCOPE_UNIVERSE;
+    rt[7] = libc::RTN_UNICAST;
+    m.raw(&rt).attr(RTA_GATEWAY, &gateway).attr_u32(RTA_OIF, index as u32);
+    match nl.request(&mut [m]) {
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
         r => r,
     }
 }

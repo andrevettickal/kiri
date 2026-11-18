@@ -261,6 +261,15 @@ pub fn publish_vm(dnat: &[netlink::Dnat], gateway: [u8; 4]) -> io::Result<()> {
     install_nat(Nat { uplink: index, redirect: true, dnat: dnat.to_vec(), gateway })
 }
 
+/// How long the VM waits for a DHCP offer before it looks for the network
+/// by ARP instead. Apple's NAT answers within a few hundred milliseconds;
+/// software on the Mac that drops the broadcast (an endpoint security or
+/// network filter) leaves it unanswered for good.
+const FALLBACK_AFTER: Duration = Duration::from_secs(8);
+
+/// How long after a try at the fallback that came to nothing the next one waits.
+const FALLBACK_RETRY: Duration = Duration::from_secs(30);
+
 enum DhcpState {
     Discovering,
     Requesting { offered: [u8; 4], server: [u8; 4] },
@@ -277,6 +286,11 @@ pub struct Dhcp {
     state: DhcpState,
     next_send: Instant,
     attempt: u32,
+    started: Instant,
+    /// The lease is an address found by ARP, not one the network gave.
+    fallback: bool,
+    /// When the fallback was last tried without finding a network.
+    fallback_tried: Option<Instant>,
     pub lease: Option<Lease>,
 }
 
@@ -306,6 +320,9 @@ impl Dhcp {
             state: DhcpState::Discovering,
             next_send: Instant::now(),
             attempt: 0,
+            started: Instant::now(),
+            fallback: false,
+            fallback_tried: None,
             lease: None,
         };
         d.send()?;
@@ -328,6 +345,42 @@ impl Dhcp {
         if !matches!(self.state, DhcpState::Bound) && Instant::now() >= self.next_send {
             self.send()?;
         }
+        if self.lease.is_none() && self.started.elapsed() >= FALLBACK_AFTER && self.fallback_tried.is_none_or(|t| t.elapsed() >= FALLBACK_RETRY) {
+            self.fallback_tried = Some(Instant::now());
+            if let Err(e) = self.use_fallback() {
+                eprintln!("kiri-init: no DHCP offer, and the fallback failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// No DHCP offer came: find the NAT network by ARP and address the VM
+    /// by hand in it, so containers have a network. DHCP keeps asking, and an
+    /// offer later replaces this.
+    fn use_fallback(&mut self) -> io::Result<()> {
+        let secs = FALLBACK_AFTER.as_secs();
+        let arp = super::arp::Arp::open(self.index, self.mac)?;
+        let Some(gateway) = arp.find_gateway() else {
+            eprintln!("kiri-init: no DHCP offer from the Mac after {secs}s, and nothing answered ARP where its NAT network usually is; the VM has no IPv4 network");
+            return Ok(());
+        };
+        let Some(ip) = arp.free_address(gateway) else {
+            eprintln!("kiri-init: no DHCP offer from the Mac after {secs}s; found it at {} but no free address beside it", ip_str(gateway));
+            return Ok(());
+        };
+        // Apple's NAT is a /24, and the Mac answers DNS at its own address.
+        let lease = Lease { ip, prefix: 24, gateway, dns: vec![gateway] };
+        eprintln!(
+            "kiri-init: no DHCP offer from the Mac after {secs}s (something may be blocking the NAT network's DHCP, such as security software); found the Mac at {} by ARP, using {}/{}",
+            ip_str(gateway),
+            ip_str(lease.ip),
+            lease.prefix
+        );
+        let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
+        netlink::add_address(&mut nl, self.index, lease.ip, lease.prefix)?;
+        netlink::add_default_route(&mut nl, self.index, lease.gateway)?;
+        self.fallback = true;
+        self.lease = Some(lease);
         Ok(())
     }
 
@@ -402,6 +455,12 @@ impl Dhcp {
                 (DhcpState::Requesting { .. }, 5) => {
                     let lease = Lease { ip: yiaddr, prefix: u32::from_be_bytes(mask).count_ones() as u8, gateway: router, dns };
                     let mut nl = Netlink::open(libc::NETLINK_ROUTE)?;
+                    if let (true, Some(old)) = (self.fallback, self.lease.take()) {
+                        eprintln!("kiri-init: DHCP answered after all; leaving {}", ip_str(old.ip));
+                        netlink::del_default_route(&mut nl, self.index, old.gateway)?;
+                        netlink::del_address(&mut nl, self.index, old.ip, old.prefix)?;
+                        self.fallback = false;
+                    }
                     netlink::add_address(&mut nl, self.index, lease.ip, lease.prefix)?;
                     netlink::add_default_route(&mut nl, self.index, lease.gateway)?;
                     self.state = DhcpState::Bound;

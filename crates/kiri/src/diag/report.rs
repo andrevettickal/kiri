@@ -385,6 +385,16 @@ pub fn assemble(home: &Path, state: &Path, facts: &Facts, redactor: &Redactor) -
         let _ = writeln!(s, "{}", lines[lines.len().saturating_sub(200)..].join("\n"));
     }
 
+    // What the VM's agent said about itself, such as a network it could not
+    // set up (no DHCP offer from the Mac): only its own lines, not a
+    // container's output.
+    let console = state.join("logs/guest-console.log");
+    let agent: Vec<String> = tail(&console, LOG_BUDGET as u64).lines().filter(|l| l.contains("kiri-init:")).map(str::to_owned).collect();
+    if !agent.is_empty() {
+        let _ = writeln!(s, "\n==== VM agent (last lines of {}) ====", console.display());
+        let _ = writeln!(s, "{}", agent[agent.len().saturating_sub(40)..].join("\n"));
+    }
+
     if let Some(list) = &facts.containers {
         let _ = writeln!(s, "\n==== Containers (names, images and status only) ====");
         s.push_str(list);
@@ -878,6 +888,7 @@ mod tests {
         }
         std::fs::write(state.join("logs/daemon.log"), log).unwrap();
         std::fs::write(state.join("daemon.log"), format!("2026-10-28T09:00:00.000Z kiri daemon: ready on unix://{h}/.kiri/run/docker.sock\n")).unwrap();
+        std::fs::write(state.join("logs/guest-console.log"), "boot noise\nkiri-init: no DHCP offer from the Mac after 8s\nweb: GET / 200\n").unwrap();
         std::fs::write(state.join("crashes/1792800000-daemon.txt"), "Kiri crash report\nMessage:  boom with Bearer abcdefghijklmnop\n").unwrap();
         std::fs::write(state.join("crashes/1792700000-ui.sent.txt"), "Kiri crash report\nMessage:  older\n").unwrap();
         std::fs::write(reports.join("kiri-2026-10-28-094107.ips"), format!("{{\"app_name\":\"kiri\",\"crashReporterKey\":\"ABCD-1234\"}}\n{{\"procPath\":\"{h}/Applications/Kiri.app\"}}")).unwrap();
@@ -891,6 +902,7 @@ mod tests {
         // The last 300 of 400 lines.
         assert!(text.contains("event 399 in ~/.kiri") && text.contains("event 100 in") && !text.contains("event 99 in"));
         assert!(text.contains("==== Log: window") && text.contains("(empty)"));
+        assert!(text.contains("==== VM agent") && text.contains("kiri-init: no DHCP offer from the Mac after 8s") && !text.contains("web: GET /"), "{text}");
         assert!(text.contains("kiri daemon: ready on unix://~/.kiri/run/docker.sock"));
         assert!(text.contains("==== Containers (names, images and status only) ====\nweb  nginx:alpine  Up 2 hours\n"));
         assert!(text.contains("2 in all") && text.contains("--- 1792800000-daemon.txt ---") && text.contains("boom with Bearer [redacted]"));
